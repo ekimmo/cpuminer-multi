@@ -37,6 +37,7 @@
 #include <curl/curl.h>
 #include "compat.h"
 #include "miner.h"
+#include "simpleminer_error_codes.h"
 
 #define PROGRAM_NAME		"minerd"
 #define LP_SCANTIME		60
@@ -302,34 +303,81 @@ json_t *json_rpc2_call_recur(CURL *curl, const char *url,
         }
     }
     json_t *res = json_rpc_call(curl, url, userpass, json_dumps(rpc_req, 0),
-            curl_err, flags | JSON_RPC_IGNOREERR);
+                                curl_err, flags | JSON_RPC_IGNOREERR);
     if(!res) goto end;
-    json_t *error = json_object_get(res, "error");
-    if(!error) goto end;
+
+    json_t *result = json_object_get(res, "result");
+    json_t *error  = json_object_get(res, "error");
+
+    bool response_ok = (result && !json_is_null(result)) && (!error || json_is_null(error));
+
+    if (response_ok) {
+        goto end;
+    }
+
     json_t *message;
+    json_t *code;
     if(json_is_string(error))
         message = error;
-    else
+    else {
         message = json_object_get(error, "message");
-    if(!message || !json_is_string(message)) goto end;
-    const char *mes = json_string_value(message);
-    if(!strcmp(mes, "Unauthenticated")) {
-        pthread_mutex_lock(&rpc2_login_lock);
-        rpc2_login(curl);
-        sleep(1);
-        pthread_mutex_unlock(&rpc2_login_lock);
-        return json_rpc2_call_recur(curl, url, userpass, rpc_req,
-            curl_err, flags, recur + 1);
-    } else if(!strcmp(mes, "Low difficulty share") || !strcmp(mes, "Block expired") || !strcmp(mes, "Invalid job id") || !strcmp(mes, "Duplicate share")) {
-        json_t *result = json_object_get(res, "result");
-        if(!result) {
-            goto end;
-        }
-        json_object_set(result, "reject-reason", json_string(mes));
-    } else {
-        applog(LOG_ERR, "json_rpc2.0 error: %s", mes);
-        return NULL;
+        code    = json_object_get(error, "code");
     }
+
+    if(code && json_is_integer(code)) { // handle error by code
+        json_int_t err_code = json_integer_value(code);
+        switch (err_code) {
+        case SIMPLEMINER_RPC_ERROR_CODE_UNKNOWN_WORKER:
+            pthread_mutex_lock(&rpc2_login_lock);
+            rpc2_login(curl);
+            sleep(1);
+            pthread_mutex_unlock(&rpc2_login_lock);
+            return json_rpc2_call_recur(curl, url, userpass, rpc_req,
+                                        curl_err, flags, recur + 1);
+            break;
+        case SIMPLEMINER_RPC_ERROR_CODE_INVALID_SHARE_DATA:
+        case SIMPLEMINER_RPC_ERROR_CODE_INVALID_JOB_ID:
+        case SIMPLEMINER_RPC_ERROR_CODE_UNKNOWN_JOB_SHARE:
+        case SIMPLEMINER_RPC_ERROR_CODE_SLIGHTLY_STALE_SHARE:
+        case SIMPLEMINER_RPC_ERROR_CODE_REALLY_STALE_SHARE:
+        case SIMPLEMINER_RPC_ERROR_CODE_DUPLICATE_SHARE:
+        case SIMPLEMINER_RPC_ERROR_CODE_INVALID_SHARE:
+            if(result && (message && json_is_string(message))) {
+                const char *mes = json_string_value(message);
+                json_object_set(result, "reject-reason", json_string(mes));
+            } else {
+                goto end;
+            }
+        default:
+            if(message && json_is_string(message)) {
+                const char *mes = json_string_value(message);
+                applog(LOG_ERR, "json_rpc2.0 error: %d : %s", err_code, mes);
+            } else {
+                applog(LOG_ERR, "json_rpc2.0 error: %d", err_code);
+            }
+            return NULL;
+        }
+    } else if(message && json_is_string(message)) { // handle error by message
+        const char *mes = json_string_value(message);
+        if(!strcmp(mes, "Unauthenticated")) {
+            pthread_mutex_lock(&rpc2_login_lock);
+            rpc2_login(curl);
+            sleep(1);
+            pthread_mutex_unlock(&rpc2_login_lock);
+            return json_rpc2_call_recur(curl, url, userpass, rpc_req,
+                                        curl_err, flags, recur + 1);
+        } else if(!strcmp(mes, "Low difficulty share") || !strcmp(mes, "Block expired") || !strcmp(mes, "Invalid job id") || !strcmp(mes, "Duplicate share")) {
+            json_t *result = json_object_get(res, "result");
+            if(!result) {
+                goto end;
+            }
+            json_object_set(result, "reject-reason", json_string(mes));
+        } else {
+            applog(LOG_ERR, "json_rpc2.0 error: %s", mes);
+            return NULL;
+        }
+    }
+
     end:
     return res;
 }
