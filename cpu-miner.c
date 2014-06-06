@@ -325,7 +325,7 @@ json_t *json_rpc2_call_recur(CURL *curl, const char *url,
     }
 
     if(code && json_is_integer(code)) { // handle error by code
-        json_int_t err_code = json_integer_value(code);
+        int err_code = json_integer_value(code);
         switch (err_code) {
         case SIMPLEMINER_RPC_ERROR_CODE_UNKNOWN_WORKER:
             pthread_mutex_lock(&rpc2_login_lock);
