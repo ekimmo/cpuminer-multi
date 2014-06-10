@@ -38,23 +38,29 @@
 #include "compat.h"
 #include "miner.h"
 #include "simpleminer_error_codes.h"
+#include "cryptonight.h"
+
+#if defined __unix__ && (!defined __APPLE__)
+#include <sys/mman.h>
+#elif defined _WIN32
+#include <windows.h>
+#endif
 
 #define PROGRAM_NAME		"minerd"
 #define LP_SCANTIME		60
 #define JSON_BUF_LEN 345
+
+#ifdef __unix__
+#include <sys/mman.h>
+#endif
 
 #ifdef __linux /* Linux specific policy and affinity management */
 #include <sched.h>
 static inline void drop_policy(void) {
     struct sched_param param;
     param.sched_priority = 0;
-
-#ifdef SCHED_IDLE
-    if (unlikely(sched_setscheduler(0, SCHED_IDLE, &param) == -1))
-#endif
-#ifdef SCHED_BATCH
-    sched_setscheduler(0, SCHED_BATCH, &param);
-#endif
+	
+	sched_setscheduler(0, SCHED_OTHER, &param);
 }
 
 static inline void affine_to_cpu(int id, int cpu) {
@@ -86,6 +92,8 @@ static inline void affine_to_cpu(int id, int cpu)
 {
 }
 #endif
+
+#define MAX_THREADS	256
 
 enum workio_commands {
     WC_GET_WORK, WC_SUBMIT_WORK,
@@ -173,6 +181,7 @@ static pthread_mutex_t rpc2_login_lock;
 static unsigned long accepted_count = 0L;
 static unsigned long rejected_count = 0L;
 static double *thr_hashrates;
+static double *thr_times;
 
 #ifdef HAVE_GETOPT_LONG
 #include <getopt.h>
@@ -471,7 +480,7 @@ bool rpc2_job_decode(const json_t *job, struct work *work) {
             float hashrate = 0.;
             pthread_mutex_lock(&stats_lock);
             for (size_t i = 0; i < opt_n_threads; i++)
-                hashrate += thr_hashrates[i];
+                hashrate += thr_hashrates[i] / thr_times[i];
             pthread_mutex_unlock(&stats_lock);
             double difficulty = (((double) 0xffffffff) / target);
             applog(LOG_INFO, "Pool set diff to %g", difficulty);
@@ -583,7 +592,7 @@ static void share_result(int result, struct work *work, const char *reason) {
     hashrate = 0.;
     pthread_mutex_lock(&stats_lock);
     for (i = 0; i < opt_n_threads; i++)
-        hashrate += thr_hashrates[i];
+        hashrate += thr_hashrates[i] / thr_times[i];
     result ? accepted_count++ : rejected_count++;
     pthread_mutex_unlock(&stats_lock);
 
@@ -1011,30 +1020,30 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work) {
 
     pthread_mutex_lock(&sctx->work_lock);
 
-    if (jsonrpc_2) {
+    //if (jsonrpc_2) {
         free(work->job_id);
         memcpy(work, &sctx->work, sizeof(struct work));
         work->job_id = strdup(sctx->work.job_id);
         pthread_mutex_unlock(&sctx->work_lock);
-    } else {
+    /*} else {
         free(work->job_id);
         work->job_id = strdup(sctx->job.job_id);
         work->xnonce2_len = sctx->xnonce2_size;
         work->xnonce2 = realloc(work->xnonce2, sctx->xnonce2_size);
         memcpy(work->xnonce2, sctx->job.xnonce2, sctx->xnonce2_size);
 
-        /* Generate merkle root */
+        // Generate merkle root
         sha256d(merkle_root, sctx->job.coinbase, sctx->job.coinbase_size);
         for (i = 0; i < sctx->job.merkle_count; i++) {
             memcpy(merkle_root + 32, sctx->job.merkle[i], 32);
             sha256d(merkle_root, merkle_root, 64);
         }
 
-        /* Increment extranonce2 */
+        // Increment extranonce2
         for (i = 0; i < sctx->xnonce2_size && !++sctx->job.xnonce2[i]; i++)
             ;
 
-        /* Assemble block header */
+        // Assemble block header
         memset(work->data, 0, 128);
         work->data[0] = le32dec(sctx->job.version);
         for (i = 0; i < 8; i++)
@@ -1059,8 +1068,10 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work) {
             diff_to_target(work->target, sctx->job.diff / 65536.0);
         else
             diff_to_target(work->target, sctx->job.diff);
-    }
+    }*/
 }
+
+struct cryptonight_ctx *persistentctxs[MAX_THREADS] = { NULL };
 
 static void *miner_thread(void *userdata) {
     struct thr_info *mythr = userdata;
@@ -1071,24 +1082,44 @@ static void *miner_thread(void *userdata) {
     unsigned char *scratchbuf = NULL;
     char s[16];
     int i;
-
+	struct cryptonight_ctx *persistentctx;
+	
     /* Set worker threads to nice 19 and then preferentially to SCHED_IDLE
      * and if that fails, then SCHED_BATCH. No need for this to be an
      * error if it fails */
+     #ifdef __linux
     if (!opt_benchmark) {
-        setpriority(PRIO_PROCESS, 0, 19);
+        //setpriority(PRIO_PROCESS, 0, 19);
+        if(!geteuid()) setpriority(PRIO_PROCESS, 0, -14);
         drop_policy();
     }
-
+	#endif
+	
     /* Cpu affinity only makes sense if the number of threads is a multiple
      * of the number of CPUs */
-    if (num_processors > 1 && opt_n_threads % num_processors == 0) {
+    /*if (num_processors > 1 && opt_n_threads % num_processors == 0) {
         if (!opt_quiet)
             applog(LOG_INFO, "Binding thread %d to cpu %d", thr_id,
                     thr_id % num_processors);
         affine_to_cpu(thr_id, thr_id % num_processors);
-    }
-
+    }*/
+    
+	persistentctx = persistentctxs[thr_id];
+	if(!persistentctx && opt_algo == ALGO_CRYPTONIGHT)
+	{
+		#if defined __unix__ && (!defined __APPLE__)
+		persistentctx = (struct cryptonight_ctx *)mmap(0, sizeof(struct cryptonight_ctx), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE, 0, 0);
+		if(persistentctx == MAP_FAILED) persistentctx = (struct cryptonight_ctx *)malloc(sizeof(struct cryptonight_ctx));
+		madvise(persistentctx, sizeof(struct cryptonight_ctx), MADV_RANDOM | MADV_WILLNEED | MADV_HUGEPAGE);
+		if(!geteuid()) mlock(persistentctx, sizeof(struct cryptonight_ctx));
+		#elif defined _WIN32
+		persistentctx = VirtualAlloc(NULL, sizeof(struct cryptonight_ctx), MEM_LARGE_PAGES, PAGE_READWRITE);
+		if(!persistentctx) persistentctx = (struct cryptonight_ctx *)malloc(sizeof(struct cryptonight_ctx));
+		#else
+		persistentctx = (struct cryptonight_ctx *)malloc(sizeof(struct cryptonight_ctx));
+		#endif
+	}
+	
     if (opt_algo == ALGO_SCRYPT) {
         scratchbuf = scrypt_buffer_alloc();
     }
@@ -1145,7 +1176,7 @@ static void *miner_thread(void *userdata) {
         else
             max64 = g_work_time + (have_longpoll ? LP_SCANTIME : opt_scantime)
                     - time(NULL );
-        max64 *= thr_hashrates[thr_id];
+        //max64 *= thr_hashrates[thr_id];
         if (max64 <= 0) {
             switch (opt_algo) {
             case ALGO_SCRYPT:
@@ -1212,7 +1243,7 @@ static void *miner_thread(void *userdata) {
             break;
         case ALGO_CRYPTONIGHT:
             rc = scanhash_cryptonight(thr_id, work.data, work.target,
-                    max_nonce, &hashes_done);
+                    max_nonce, &hashes_done, persistentctx);
             break;
 
         default:
@@ -1225,11 +1256,11 @@ static void *miner_thread(void *userdata) {
         timeval_subtract(&diff, &tv_end, &tv_start);
         if (diff.tv_usec || diff.tv_sec) {
             pthread_mutex_lock(&stats_lock);
-            thr_hashrates[thr_id] = hashes_done
-                    / (diff.tv_sec + 1e-6 * diff.tv_usec);
+            thr_hashrates[thr_id] = hashes_done;
+            thr_times[thr_id] = (diff.tv_sec + 1e-6 * diff.tv_usec);
             pthread_mutex_unlock(&stats_lock);
         }
-        if (!opt_quiet) {
+        /*if (!opt_quiet) {
             switch(opt_algo) {
             case ALGO_CRYPTONIGHT:
                 applog(LOG_INFO, "thread %d: %lu hashes, %.2f H/s", thr_id,
@@ -1258,7 +1289,7 @@ static void *miner_thread(void *userdata) {
                     break;
                 }
             }
-        }
+        }*/
 
         /* if nonce found, submit work */
         if (rc && !opt_benchmark && !submit_work(mythr, &work))
@@ -1266,7 +1297,7 @@ static void *miner_thread(void *userdata) {
     }
 
     out: tq_freeze(mythr->q);
-
+	
     return NULL ;
 }
 
@@ -1786,16 +1817,25 @@ static void parse_cmdline(int argc, char *argv[]) {
 
 #ifndef WIN32
 static void signal_handler(int sig) {
+	int i;
     switch (sig) {
     case SIGHUP:
         applog(LOG_INFO, "SIGHUP received");
         break;
     case SIGINT:
         applog(LOG_INFO, "SIGINT received, exiting");
+        #if defined __unix__ && (!defined __APPLE__)
+		if(opt_algo == ALGO_CRYPTONIGHT)
+			for(i = 0; i < opt_n_threads; i++) munmap(persistentctxs[i], sizeof(struct cryptonight_ctx));
+		#endif
         exit(0);
         break;
     case SIGTERM:
         applog(LOG_INFO, "SIGTERM received, exiting");
+        #if defined __unix__ && (!defined __APPLE__)
+		if(opt_algo == ALGO_CRYPTONIGHT)
+			for(i = 0; i < opt_n_threads; i++) munmap(persistentctxs[i], sizeof(struct cryptonight_ctx));
+		#endif
         exit(0);
         break;
     }
@@ -1806,7 +1846,11 @@ int main(int argc, char *argv[]) {
     struct thr_info *thr;
     long flags;
     int i;
-
+	
+	#ifdef __unix__
+	if(geteuid()) applog(LOG_INFO, "I go faster as root.");
+	#endif
+	
     rpc_user = strdup("");
     rpc_pass = strdup("");
 
@@ -1902,7 +1946,9 @@ int main(int argc, char *argv[]) {
     thr_hashrates = (double *) calloc(opt_n_threads, sizeof(double));
     if (!thr_hashrates)
         return 1;
-
+	
+	thr_times = (double *)calloc(opt_n_threads, sizeof(double));
+	
     /* init workio thread info */
     work_thr_id = opt_n_threads;
     thr = &thr_info[work_thr_id];
@@ -1973,6 +2019,9 @@ int main(int argc, char *argv[]) {
     pthread_join(thr_info[work_thr_id].pth, NULL );
 
     applog(LOG_INFO, "workio thread dead, exiting.");
-
+	#if defined __unix__ && (!defined __APPLE__)
+	if(opt_algo == ALGO_CRYPTONIGHT)
+		for(i = 0; i < opt_n_threads; i++) munmap(persistentctxs[i], sizeof(struct cryptonight_ctx));
+	#endif
     return 0;
 }
