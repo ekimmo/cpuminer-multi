@@ -351,6 +351,7 @@ json_t *json_rpc2_call_recur(CURL *curl, const char *url,
         case SIMPLEMINER_RPC_ERROR_CODE_REALLY_STALE_SHARE:
         case SIMPLEMINER_RPC_ERROR_CODE_DUPLICATE_SHARE:
         case SIMPLEMINER_RPC_ERROR_CODE_INVALID_SHARE:
+        case SIMPLEMINER_RPC_ERROR_CODE_DENIED_SHARE:
             if(result && (message && json_is_string(message))) {
                 const char *mes = json_string_value(message);
                 json_object_set(result, "reject-reason", json_string(mes));
